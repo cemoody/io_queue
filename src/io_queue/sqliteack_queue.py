@@ -255,8 +255,11 @@ class SQLiteAckQueue:
         if len(rows) != len(keys):
             raise KeyError("Could not update all keys")
         self.con.commit()
-    
-    def set(self, row_key_dicts, field_dicts):
+
+    def set(self, row_key_dict, field_dict):
+        return self.sets([row_key_dict], [field_dict])
+ 
+    def sets(self, row_key_dicts, field_dicts):
         for row_key_dict, field_dict in zip(row_key_dicts, field_dicts):
             (row_id_col, row_id_val), = list(row_key_dict.items())
             for column_name, column_value in field_dict.items():
@@ -410,7 +413,7 @@ def test():
 
     # Will update item fields in place
     assert q.count() == 21
-    q.set([{'id': i} for i in range(8)],
+    q.sets([{'id': i} for i in range(8)],
           [{"id2": i + 500} for i in range(8)])
     assert q.count() == 21
     items = q.gets(50, read_all=True)

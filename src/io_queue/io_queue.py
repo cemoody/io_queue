@@ -7,6 +7,7 @@
 -   and (how many inputs each task is claiming)
 -   and the timestamp (to keep tasks fresh and cycle out stale ones)
 """
+from ntpath import join
 import os
 import math
 from sqlitedict import SqliteDict
@@ -67,24 +68,37 @@ class IOQueue:
             if delta := q.size_delta() > q.batch_size:
                 n_tasks = int(math.floor(delta / q.batch_size))
                 for _ in range(n_tasks):
-                    task_id = q.create_task()
-                    q.set_task(task_id, status="submitted")
+                    task_id = q.init_task()
+                    q.tasks.set({'task_id': task_id}, dict(status="submitted"))
                     if use_modal:
                         call_id = func.submit(task_id)
-                        q.set_task(task_id, call_id=call_id)
+                        q.tasks.set({'task_id': task_id}, dict(call_id=call_id))
                     else:
                         func(task_id)
 
 
 class Store:
-    def __init__(self, filename, input_q=None, output_q=None, skip_if_present=None,
+    _SQL_SIZE_DELTA = """
+    SELECT COUNT(*) 
+    FROM {input_q_name} left
+    LEFT JOIN {output_q_name} right 
+    ON left.{input_q_id_column}=right{output_q_id_column}
+    WHERE right.{output_q_id_column} IS NULL
+    """
+
+    def __init__(self, filename, input_q_name=None, output_q_name=None, 
+                 input_q_id_column=None,
+                 output_q_id_column=None,
                  batch_size=None, name=None):
         self.filename = filename
-        self.input_q = SQLiteAckQueue(filename, table_name=input_q)
-        self.output_q = SQLiteAckQueue(filename, table_name=output_q)
-        self.tasks = SqliteDict(filename, tablename="tasks", autocommit=True)
-        self.skip_if_present = skip_if_present
+        self.input_q_name = input_q_name
+        self.output_q_name = output_q_name
+        self.input_q = SQLiteAckQueue(filename, table_name=input_q_name)
+        self.output_q = SQLiteAckQueue(filename, table_name=output_q_name)
+        self.tasks = SQLiteAckQueue(filename, table_name="_tasks")
         self.batch_size = batch_size 
+        self.input_q_id_column = self.input_q_id_column
+        self.output_q_id_column = self.output_q_id_column
         self.name = name
 
     def put(self, rows):
@@ -103,13 +117,20 @@ class Store:
         """ Estimate how many rows are in input q that are not 
         in the output q and also not in submitted and ongoing jobs.
         """
-        pass
+        query = self._SQL_SIZE_DELTA.format(
+            input_q_name=self.input_q_name,
+            output_q_name=self.output_q_name,
+            input_q_id_column=self.input_q_id_column,
+            output_q_id_column=self.output_q_id_column)
+        cursor = self.input_q.con.execute(query)
+        (n,) = cursor.fetchone()
+        return n
 
-    def create_task(self, status="created"):
+    def init_task(self, status="created"):
         """ Create a new task entry
         """
         task_id = uuid4()
-        self.tasks[task_id] = dict(status=status)
+        self.tasks.put(dict(status=status, task_id=task_id))
         logger.debug(f"Created task {task_id}")
         return task_id
     
@@ -128,12 +149,13 @@ def test_ioq_outputq():
 
     @mq.link(output_q="outq")
     def qload():
-        idxs = list(range(25))
+        idxs = [dict(idx=idx) for idx in range(25)]
         return idxs
     
     mq.run(use_modal=False)
-    keys, _ = mq.output_q.gets(50, ack=False)
-    assert all(k in keys for k in range(25))
+    items = mq.output_q.gets(50, ack=False, read_all=True)
+    flat = [item['idx'] for item in items]
+    assert all(k in flat for k in range(25))
     os.remove("./cache")
 
 
