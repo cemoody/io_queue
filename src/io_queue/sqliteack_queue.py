@@ -51,6 +51,10 @@ class SQLiteAckQueue:
         "WHERE status < %s "
         "ORDER BY {key_column} ASC LIMIT {limit} OFFSET {offset}" % AckStatus.unack
     )
+    _SQL_SELECT_ALL = (
+        "SELECT {key_column}, timestamp, status {table_columns} FROM {table_name} "
+        "ORDER BY {key_column} ASC LIMIT {limit} OFFSET {offset}"
+    )
     _SQL_MARK_ACK_SELECT = """
         SELECT _id, data FROM {table_name}
         WHERE {key_column} IN ({indices})
@@ -58,6 +62,11 @@ class SQLiteAckQueue:
     _SQL_MARK_ACK_UPDATE = """
         UPDATE {table_name} SET status = {status} 
         WHERE {key_column} IN ({indices})
+        RETURNING *
+    """
+    _SQL_UPDATE_SINGLE_ROW = """
+        UPDATE {table_name} SET {column_name} = {column_value}
+        WHERE {row_id_col} = {row_id_val}
         RETURNING *
     """
     _SQL_DELETE = """
@@ -126,12 +135,13 @@ class SQLiteAckQueue:
     def get(self):
         return self.gets(1)
 
-    def gets(self, n, random_offset=False, ack=True, return_keys=False):
+    def gets(self, n, random_offset=False, ack=True, return_keys=False,
+             read_all=False):
         offset = 0
         if random_offset:
             offset = random.randint(0, n * 100)
         # Select rows to update
-        rows = self.select(n, offset)
+        rows = self.select(n, offset, read_all=read_all)
         # Skip the id & timestamp  & status fields by only
         # reading from the 3rd field onward
         items = [{k: v for (k, v) in zip(self.columns, row[3:])} for row in rows]
@@ -144,8 +154,10 @@ class SQLiteAckQueue:
             return keys, items
         return items
 
-    def select(self, n, offset=0):
-        qwhere = self._SQL_SELECT.format(
+    def select(self, n, offset=0, read_all=False):
+
+        qwhere = self._SQL_SELECT_ALL if read_all else self._SQL_SELECT
+        qwhere = qwhere.format(
             table_name=self._TABLE_NAME,
             key_column=self._KEY_COLUMN,
             table_columns = "," + ", ".join(self.columns) if len(self.columns) > 0 else "",
@@ -182,27 +194,29 @@ class SQLiteAckQueue:
         query = ""
         for k, v in row.items():
             if k not in self.columns:
-                v_type = type(v)
-                if isinstance(v, str):
-                    v_type = "TEXT"
-                elif isinstance(v, float):
-                    v_type = "REAL"
-                elif isinstance(v, int):
-                    v_type = "INTEGER"
-                elif isinstance(v, dict):
-                    raise ValueError("Cannot have nested dictionaries")
-                else:
-                    v_type = "TEXT"
-                query = self._SQL_CREATE_COLUMN.format(table_name=self._TABLE_NAME, column_name=k, column_type=v_type) 
-                self.con.execute(query)
-                self.columns.append(k)
+                self.create_column(k, v)
+    
+    def create_column(self, name, value):
+        if isinstance(value, str):
+            v_type = "TEXT"
+        elif isinstance(value, float):
+            v_type = "REAL"
+        elif isinstance(value, int):
+            v_type = "INTEGER"
+        elif isinstance(value, dict):
+            raise ValueError("Cannot have nested dictionaries")
+        else:
+            v_type = "TEXT"
+        query = self._SQL_CREATE_COLUMN.format(table_name=self._TABLE_NAME, column_name=name, column_type=v_type) 
+        self.con.execute(query)
+        self.columns.append(name)
 
     def reorder_to_match_table_schema(self, rows):
         new_rows = []
         for i, row in enumerate(rows):
             new_row = [time.time()]
             for column in self.columns:
-                new_row.append(row.pop(column))
+                new_row.append(row.pop(column, None))
             assert len(row) == 0, f"Extra columns not present in table found in {i}th row"
             new_rows.append(new_row)
         return new_rows
@@ -241,6 +255,21 @@ class SQLiteAckQueue:
         if len(rows) != len(keys):
             raise KeyError("Could not update all keys")
         self.con.commit()
+    
+    def set(self, row_key_dicts, field_dicts):
+        for row_key_dict, field_dict in zip(row_key_dicts, field_dicts):
+            (row_id_col, row_id_val), = list(row_key_dict.items())
+            for column_name, column_value in field_dict.items():
+                if column_name not in self.columns:
+                    self.create_column(column_name, column_value)
+                qry = self._SQL_UPDATE_SINGLE_ROW.format(table_name=self._TABLE_NAME,
+                                                         row_id_col=row_id_col,
+                                                         row_id_val=row_id_val,
+                                                         column_name=column_name,
+                                                         column_value=column_value)
+                cursor = self.con.execute(qry)
+                rows = cursor.fetchall()
+                assert len(rows) == 1, f"Did not find row for {row_id_col}={row_id_val}"
 
     def delete(self, keys):
         indices = ",".join((str(r) for r in keys))
@@ -330,7 +359,6 @@ def test():
     except ValueError:
         pass
 
-
     # Initialize list
     q.puts([{'id': i} for i in range(10)])
     assert q.count() == 10
@@ -372,13 +400,21 @@ def test():
     assert q.count() == 21
     assert q.free() == 0
 
+    # Test that we got back our original items
     all_items.extend(items)
-
     items_1 = [i for i in all_items if i['color'] is None]
     items_2 = [i for i in all_items if i['color'] is not None]
     assert len(all_items) == 21
     assert len(items_1) == 10
     assert len(items_2) == 11
+
+    # Will update item fields in place
+    assert q.count() == 21
+    q.set([{'id': i} for i in range(8)],
+          [{"id2": i + 500} for i in range(8)])
+    assert q.count() == 21
+    items = q.gets(50, read_all=True)
+    assert len([i for i in items if i['id2'] is not None]) == 8
 
 
     os.remove('temp.db')
