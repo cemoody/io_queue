@@ -1,0 +1,14 @@
+{
+  "_output_dir": "/Users/chris/code",
+  "_template": "gh:cjolowicz/cookiecutter-hypermodern-python",
+  "author": "Christopher Moody",
+  "copyright_year": "2022",
+  "development_status": "Development Status :: 1 - Planning",
+  "email": "chrisemoody@gmail.com",
+  "friendly_name": "IOQueue",
+  "github_user": "cemoody",
+  "license": "MIT",
+  "package_name": "io_queue",
+  "project_name": "io_queue",
+  "version": "0.0.0"
+}
