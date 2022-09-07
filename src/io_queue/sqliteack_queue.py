@@ -341,28 +341,47 @@ def test():
     assert q.free() == 10
     assert q.done() == 0
 
+    # Will add a new column
+    q.puts([{'id': i, 'color': str(i + 100)} for i in range(10, 21)])
+    assert q.count() == 21
+    assert q.free() == 21
+    assert q.done() == 0
+
     # Get items
     keys, items = q.gets(7, return_keys=True)
     assert len(keys) == len(items) == 7
-    assert q.count() == 10
-    assert q.free() == 3
+    assert q.count() == 21
+    assert q.free() == 14
     assert len(keys) == len(items) == 7
+
+    all_items = [i for i in items]
 
     # We have finished processing keys; now ack them
     q.acks(keys)
-    assert q.count() == 10
-    assert q.free() == 3
+    assert q.count() == 21
+    assert q.free() == 14
 
     # Ack them again -- should be idempotent
     q.acks(keys)
-    assert q.count() == 10
-    assert q.free() == 3
+    assert q.count() == 21
+    assert q.free() == 14
 
     # This should get the remainder of the items
-    keys, items = q.gets(20, return_keys=True)
-    assert len(keys) == len(items) == 3
-    assert q.count() == 10
+    keys, items = q.gets(50, return_keys=True)
+    assert len(keys) == len(items) == 14
+    assert q.count() == 21
     assert q.free() == 0
+
+    all_items.extend(items)
+
+    items_1 = [i for i in all_items if i['color'] is None]
+    items_2 = [i for i in all_items if i['color'] is not None]
+    assert len(all_items) == 21
+    assert len(items_1) == 10
+    assert len(items_2) == 11
+
+
+    os.remove('temp.db')
 
 
 if __name__ == "__main__":
