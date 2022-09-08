@@ -76,11 +76,13 @@ class SQLiteAckQueue:
     """
     _SQL_INSERT = (
         "INSERT OR IGNORE INTO {table_name} (timestamp, status, {table_columns})"
-        " VALUES (?, %s, {table_values}) " % AckStatus.inited
+        " VALUES (?, %s, {table_values}) " 
+        " RETURNING {key_column} " % AckStatus.inited
     )
     _SQL_COUNT = "SELECT COUNT(*) FROM {table_name}"
     _SQL_FREE = "SELECT COUNT(*) FROM {table_name} WHERE status < %s" % AckStatus.unack
     _SQL_DONE = "SELECT COUNT(*) FROM {table_name} WHERE status > %s" % AckStatus.unack
+    _SQL_ACTIVE = "SELECT COUNT(*) FROM {table_name} WHERE status >= %s AND status < %s" % (AckStatus.unack, AckStatus.ack_failed)
     _SQL_TIMEOUT = """
         UPDATE {table_name}
         SET status = %s
@@ -173,10 +175,12 @@ class SQLiteAckQueue:
         return rows
 
     def put(self, item):
-        return self.puts([item])
+        key, = self.puts([item])
+        return key
 
     def puts(self, items):
-        assert len(items) > 0, "Must have more than a single item"
+        if len(items) == 0:
+            return []
         if not all(isinstance(i, dict) for i in items):
             raise ValueError("Items must be dicts")
         if not all(len(i) > 0 for i in items):
@@ -186,12 +190,20 @@ class SQLiteAckQueue:
         items = self.reorder_to_match_table_schema(items)
         cols_str = ", ".join(self.columns)
         vals_str = ", ".join("?" for _ in self.columns)
-        insert = self._SQL_INSERT.format(table_name=self._TABLE_NAME,
-                                         table_columns=cols_str,
-                                         table_values=vals_str )
-        self.con.executemany(insert, items)
+        keys = []
+        for item in items:
+            insert = self._SQL_INSERT.format(table_name=self._TABLE_NAME,
+                                             table_columns=cols_str,
+                                             table_values=vals_str,
+                                             key_column=self._KEY_COLUMN)
+            cursor = self.con.execute(insert, item)
+            ret = cursor.fetchone()
+            if ret is not None:
+                key, = ret
+                keys.append(key)
         self.con.commit()
-    
+        return keys
+
     def update_table_schema(self, row):
         """ Update table schema """
         for k, v in row.items():
@@ -323,6 +335,12 @@ class SQLiteAckQueue:
         self.con.commit()
         return n
 
+    def active(self):
+        cursor = self.con.execute(self._SQL_ACTIVE.format(table_name=self._TABLE_NAME))
+        (n,) = cursor.fetchone()
+        self.con.commit()
+        return n
+
     @cachetools.func.ttl_cache(maxsize=1, ttl=10)
     def approx_count(self):
         return self._count()
@@ -343,6 +361,9 @@ class SQLiteAckQueue:
 
 
 def test():
+    if os.path.exists("temp.db"):
+        os.remove("temp.db")
+
     # Initialized queue should be zero sized
     q = SQLiteAckQueue("temp.db", unique_column="id")
     assert q.count() == 0

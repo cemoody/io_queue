@@ -1,8 +1,12 @@
 import math
 import os.path
-from io_queue.sqliteack_queue import AckStatus
+from dataclasses import dataclass
+from typing import Callable
+
+from loguru import logger
 
 from io_queues import IOQueues
+from sqliteack_queue import AckStatus
 from sqliteack_queue import SQLiteAckQueue
 
 
@@ -16,46 +20,61 @@ def switch_modal_function(stub=None, use_modal=True, **kwargs):
     return wrapper
 
 
+def submit_func_default(func, task_id, **kwargs):
+    return func(task_id, **kwargs)
+
+
+@dataclass
+class Link:
+    ioqueues: IOQueues
+    function: Callable
+    tasks: SQLiteAckQueue
+
+    def set_inputs(self, rows):
+        return self.ioqueues.input_q.puts(rows)
+    
+    def get_outputs(self, n):
+        return self.ioqueues.output_q.gets(n)
+
+
 class Linker:
     links = {}
     _task_count = {}
 
-    def __init__(self, stub=None, fn_q="queues.db", fn_tasks="tasks.db"):
+    def __init__(self, fn_q="queues.db", fn_tasks="tasks.db", submit_func=submit_func_default):
         self.fn_q = fn_q
         self.fn_tasks = fn_tasks
-        self.stub = stub
+        self.submit_func = submit_func
 
-    def link(self, modal_function_kwargs={}, taskq_kwargs={}, **kwargs):
+    def link(self, taskq_kwargs={}, **kwargs):
         def wrapper(inner_func):
             name = inner_func.__name__
-            q = IOQueues(self.root, name=name, **kwargs)
+            q = IOQueues(self.fn_q, name=name, **kwargs)
             tasks = SQLiteAckQueue(self.fn_tasks, table_name=f"tasks_{name}", **taskq_kwargs)
 
-            @switch_modal_function(self.stub, use_modal=self.use_modal, 
-                                   **modal_function_kwargs)
             def func(task_id, **kwargs):
-                tasks.ack(task_id)
+                tasks.acks([task_id])
                 # If there's not input queue, just run the function
                 # with no arguments
-                args = [q.gets()]  if q.input_q else []
+                args = [q.gets()] if q.input_q else []
                 out_rows = inner_func(*args, **kwargs)
                 if q.output_q_name:
                     q.puts(out_rows)
                 # Mark this task as complete
-                tasks.acks(task_id, status=AckStatus.ack_done)
+                tasks.acks([task_id], status=AckStatus.ack_done)
 
-            self.links[name] = (q, func, tasks)
+            self.links[name] = Link(q, func, tasks)
             return func
         return wrapper
 
-    def run_once(self, use_modal=False):
-        self.use_modal = use_modal
-        for name, (q, func, tasks) in self.links.items():
-            delta = q.size_delta()
-            n_tasks_required = int(math.ceil(delta / q.batch_size))
-            while n_tasks_required >= 0:
-                self.create_task(name, q, func, tasks)
-                n_tasks_required -= 1
+    def run_once(self):
+        for name, link in self.links.items():
+            delta = link.ioqueues.size_ready()
+            n_tasks_required = int(math.ceil(delta / link.ioqueues.batch_size))
+            n_tasks_active = link.tasks.active()
+            while n_tasks_required >= n_tasks_active:
+                self.create_task(name, link)
+                n_tasks_active += 1
     
     def run_until_complete(self, **kwargs):
         while not self._check_complete():
@@ -63,65 +82,48 @@ class Linker:
 
     def _check_complete(self):
         completes = {}
-        for name, (q, func, tasks) in self.links.items():
-            completes[name] = q.size_delta() == 0
+        for name, link in self.links.items():
+            completes[name] = link.ioqueues.size_ready() == 0
         return all(completes.values())
 
-    def create_task(self, name, q, func, tasks):
-        task_count = self._task_count.get(name, 0)
-        task_id = q.init_task()
-        task_cfg = {'task_index': task_count}
-        tasks.put(task_cfg)
-        if self.use_modal:
-            call_id = func.submit(task_id)
-            q.tasks.set({'task_id': task_id}, dict(call_id=call_id))
-        else:
-            func(task_id)
-        self._task_count[name] = task_count + 1
+    def create_task(self, name, link):
+        task_id = self._task_count.get(name, 0)
+        task_cfg = {'task_index': task_id}
+        logger.info(f"Creating task {task_id} for {name}")
+        key = link.tasks.put(task_cfg)
+        self.submit_func(link.function, key, **task_cfg)
+        self._task_count[name] = task_id + 1
 
 
-
-def test_ioq_load(n=25):
-    fn = 'test_cache'
+def test_ioq_simple(n=25):
+    fn = 'tasks.db'
+    if os.path.exists(fn):
+        os.remove(fn)
+    fn = 'queues.db'
     if os.path.exists(fn):
         os.remove(fn)
 
-    l = Linker(root=fn)
-    @l.link(output_q_name="outq")
-    def qload():
-        idxs = [dict(idx=idx) for idx in range(n)]
-        return idxs
-    
-    # This should place 25 items into the outq
-    l.run_until_complete(use_modal=False)
-    items = l.links['qload'].output_q.gets(50)
-    flat = [item['idx'] for item in items]
-    assert all(k in flat for k in range(25))
-    os.remove(fn)
-
-
-def test_ioq_load(n=25):
-    fn = 'test_cache'
-    if os.path.exists(fn):
-        os.remove(fn)
-
-    l = Linker(root=fn)
-    @l.link(output_q_name="inq")
-    def qload():
-        idxs = [dict(idx=idx) for idx in range(n)]
-        return idxs
+    l = Linker(fn)
 
     @l.link(input_q_name="inq", output_q_name="outq")
     def transform(items):
-        idxs = [{**item, 'out': item['idx'] + 50 } for item in items]
+        idxs = [{'out': item['idx'] + 50, **item} for item in items]
         return idxs
+
+    # Load up the DAG with initial data
+    inputs = [dict(idx=idx) for idx in range(n)]
+    l.links['transform'].set_inputs(inputs)
     
-    # This should place 25 items into the out queue from transform
-    l.run_until_complete(use_modal=False)
-    items = l.links['transform'].output_q.gets(50)
-    flat = [item['idx'] for item in items]
+    # Run until all links report there's no more data
+    # left to process
+    l.run_until_complete()
+
+    # Check outputs are what we expected
+    items = l.links['transform'].get_outputs(100)
+    flat = [item['out'] for item in items]
     assert all(k in flat for k in range(50, 75))
-    os.remove(fn)
+    os.remove("tasks.db")
+    os.remove("queues.db")
 
 if __name__ == '__main__':
-    test_ioq_load()
+    test_ioq_simple()
