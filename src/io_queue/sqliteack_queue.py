@@ -30,6 +30,28 @@ class DummySerializer:
         return x
 
 
+class DynamicList(list):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def __getitem__(self, idx):
+        self.expand(idx)
+        return super().__getitem__(idx)
+
+    def __setitem__(self, idx, val):
+        self.expand(idx)
+        return super().__setitem__(idx, val)
+
+    def expand(self, idx):
+        if isinstance(idx, int):
+            idx += 1
+        elif isinstance(idx, slice):
+            idx = max(idx.start, idx.stop)
+
+        if idx > len(self):
+            self.extend([0] * (idx - len(self)))
+
+
 dummy_serializer = DummySerializer()
 
 
@@ -147,6 +169,7 @@ class SQLiteAckQueue:
         # Skip the id & timestamp  & status fields by only
         # reading from the 3rd field onward
         items = self._process_rows(rows)
+        items = self.unflatten_array_columns(items)
         keys = [row[0] for row in rows]
         # Mark them as checked out
         if ack:
@@ -186,6 +209,7 @@ class SQLiteAckQueue:
         if not all(len(i) > 0 for i in items):
             raise ValueError("Dicts cannot be empty")
         self.max_size_block()
+        items = self.flatten_array_columns(items)
         self.update_table_schema(items[0])
         items = self.reorder_to_match_table_schema(items)
         cols_str = ", ".join(self.columns)
@@ -203,6 +227,40 @@ class SQLiteAckQueue:
                 keys.append(key)
         self.con.commit()
         return keys
+
+    def flatten_array_columns(self, items):
+        new_items = []
+        for item in items:
+            new_item = {}
+            for key, value in item.items():
+                if isinstance(value, list):
+                    for idim, element in enumerate(value):
+                        new_item[f'{key}_dim_{idim:04d}'] = element
+                else:
+                    new_item[key] = value
+            new_items.append(new_item)
+        return new_items
+    
+    def unflatten_array_columns(self, items):
+        new_items = []
+        for item in items:
+            new_item = {}
+            arrays = {}
+            for key, value in item.items():
+                if '_dim_' in key:
+                    column_name = key.split('_')[0]
+                    column_idim = int(key.split('_')[2])
+                    arr = arrays.get(column_name, DynamicList())
+                    arr[column_idim] = value
+                    arrays[column_name] = arr
+                else:
+                    new_item[key] = value
+            for column, dyn_array in arrays.items():
+                arr =  list(dyn_array)
+                assert all(x is not None for x in arr)
+                new_item[column] = arr
+            new_items.append(new_item)
+        return new_items
 
     def update_table_schema(self, row):
         """ Update table schema """
@@ -441,9 +499,22 @@ def test():
     items = q.gets(50, read_all=True)
     assert len([i for i in items if i['id2'] is not None]) == 8
 
+    os.remove('temp.db')
 
+
+def test_vec():
+    if os.path.exists("temp.db"):
+        os.remove("temp.db")
+
+    # Initialized queue should be zero sized
+    q = SQLiteAckQueue("temp.db", unique_column="id")
+    # Auto expand vectors into many columns
+    q.puts([{'vec': [1, 2, 3]}])
+    row, = q.gets(1)
+    assert sum(row['vec']) == 6
     os.remove('temp.db')
 
 
 if __name__ == "__main__":
+    test_vec()
     test()
