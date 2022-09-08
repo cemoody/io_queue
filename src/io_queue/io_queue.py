@@ -1,117 +1,84 @@
 """
 - IOQueue.link submits row ids to the job, the job then acks those job ids and marks them as complete
 - ensure that queue size is easily readable without running a table scan so that way the job runner knows when to fire off jobs
-- keep backing sqlite store on a shared modal volume when running remotely
-- use file lock on queuestore to prevent concurrent writes
+- keep backing sqlite ioq on a shared modal volume when running remotely
+- use file lock on queueioq to prevent concurrent writes
 - Mark tasks  (submitted, started, ended) to keep track of them
 -   and (how many inputs each task is claiming)
 -   and the timestamp (to keep tasks fresh and cycle out stale ones)
 """
-from ntpath import join
 import os
 import math
-from sqlitedict import SqliteDict
 from uuid import uuid4
 from loguru import logger
+from sqliteack_queue import AckStatus
 
-from io_queue.sqliteack_queue import SQLiteAckQueue
+from sqliteack_queue import SQLiteAckQueue
 
-
-def create_table(table_name, row):
-    query = "CREATE TABLE {0} ({1})".format(table, ", ".join(fieldset))
-
-        c.execute(query)
-
-
-def switch_modal_function(stub=None, use_modal=True, **kwargs):
-    def wrapper(inner_func):
-        if use_modal:
-            assert stub is not None, "If using modal, please provide `stub`."
-            return stub.function(**kwargs)(inner_func)
-        else:
-            return inner_func
-    return wrapper
-
-
-class IOQueue:
-    links = {}
-
-    def __init__(self, stub):
-        self.stub = stub
-
-    def link(self, input_q=None, output_q=None, skip_if_present=None,
-             batch_size=1, modal_function_kwargs={}):
-        def wrapper(inner_func):
-            name = inner_func.__name__
-            q = Store(self.root, input_q=input_q, output_q=output_q,
-                      skip_if_present=skip_if_present, batch_size=batch_size,
-                      name=name)
-
-            @switch_modal_function(self.stub, use_modal=self.use_modal, 
-                                   **modal_function_kwargs)
-            def func(task_id, **kwargs):
-                q.set_task(task_id, status="started")
-
-                for in_rows in q.get(batch_size):
-                    out_rows = inner_func(in_rows, **kwargs)
-                    if output_q:
-                        q.puts(out_rows)
-                q.set_task(task_id, status="done")
-
-            self.links[name] = (q, func)
-            return func
-        return wrapper
-
-    def run(self, use_modal=False):
-        self.use_modal = use_modal
-        for (q, func) in self.links.values():
-            if delta := q.size_delta() > q.batch_size:
-                n_tasks = int(math.floor(delta / q.batch_size))
-                for _ in range(n_tasks):
-                    task_id = q.init_task()
-                    q.tasks.set({'task_id': task_id}, dict(status="submitted"))
-                    if use_modal:
-                        call_id = func.submit(task_id)
-                        q.tasks.set({'task_id': task_id}, dict(call_id=call_id))
-                    else:
-                        func(task_id)
-
-
-class Store:
+class IOQueues:
     _SQL_SIZE_DELTA = """
     SELECT COUNT(*) 
-    FROM {input_q_name} left
-    LEFT JOIN {output_q_name} right 
-    ON left.{input_q_id_column}=right{output_q_id_column}
-    WHERE right.{output_q_id_column} IS NULL
-    """
+    FROM {input_q_name} 
+    LEFT JOIN {output_q_name} 
+    ON {input_q_name}.{input_q_id_column}={output_q_name}.{output_q_id_column}
+    WHERE {output_q_name}.{output_q_id_column} IS NULL
+     AND {input_q_name}.status < %s
+    """ % (AckStatus.unack)
+
+    _SQL_GETS = """
+    SELECT {input_q_name}.*
+    FROM {input_q_name} 
+    LEFT JOIN {output_q_name} 
+    ON {input_q_name}.{input_q_id_column}={output_q_name}.{output_q_id_column}
+    WHERE {output_q_name}.{output_q_id_column} IS NULL
+     AND {input_q_name}.status < %s
+    """ % (AckStatus.unack)
 
     def __init__(self, filename, input_q_name=None, output_q_name=None, 
                  input_q_id_column=None,
                  output_q_id_column=None,
-                 batch_size=None, name=None):
+                 batch_size=None, name=None,
+                 queue_kwargs={}):
         self.filename = filename
         self.input_q_name = input_q_name
         self.output_q_name = output_q_name
-        self.input_q = SQLiteAckQueue(filename, table_name=input_q_name)
-        self.output_q = SQLiteAckQueue(filename, table_name=output_q_name)
-        self.tasks = SQLiteAckQueue(filename, table_name="_tasks")
+        self.input_q = SQLiteAckQueue(filename, table_name=input_q_name, **queue_kwargs)
+        self.output_q = SQLiteAckQueue(filename, table_name=output_q_name, **queue_kwargs)
+        self.tasks = SQLiteAckQueue(filename, table_name="_tasks", **queue_kwargs)
         self.batch_size = batch_size 
-        self.input_q_id_column = self.input_q_id_column
-        self.output_q_id_column = self.output_q_id_column
+        self.input_q_id_column = input_q_id_column or "_id"
+        self.output_q_id_column = output_q_id_column or "_id"
         self.name = name
+    
+    def acks(self, keys):
+        self.input_q.acks(keys)
 
-    def put(self, rows):
+    def puts(self, rows):
         """ Place data rows in the output queue.
         """
-        pass
+        self.output_q.puts(rows)
 
-    def get(self, batch_size=1):
+    def gets(self, batch_size=None):
         """ Get an interator over batches from the input queue
         that are not in the output q.
         """
-        logger.debug(f"Set {task_id} to {fields}")
-        yield rows
+        if batch_size is None:
+            batch_size = self.batch_size
+        if self.input_q is None:
+            return None
+        query = self._SQL_GETS.format(
+            input_q_name=self.input_q_name,
+            output_q_name=self.output_q_name,
+            input_q_id_column=self.input_q_id_column,
+            output_q_id_column=self.output_q_id_column,
+            batch_size=self.batch_size
+        )
+        cursor = self.input_q.con.execute(query)
+        rows = cursor.fetchall()
+        keys = [row[0] for row in rows]
+        items = self.input_q._process_rows(rows)
+        self.input_q.updates(keys, AckStatus.unack)
+        return keys, items
 
     def size_delta(self):
         """ Estimate how many rows are in input q that are not 
@@ -121,7 +88,8 @@ class Store:
             input_q_name=self.input_q_name,
             output_q_name=self.output_q_name,
             input_q_id_column=self.input_q_id_column,
-            output_q_id_column=self.output_q_id_column)
+            output_q_id_column=self.output_q_id_column
+            )
         cursor = self.input_q.con.execute(query)
         (n,) = cursor.fetchone()
         return n
@@ -133,7 +101,7 @@ class Store:
         self.tasks.put(dict(status=status, task_id=task_id))
         logger.debug(f"Created task {task_id}")
         return task_id
-    
+
     def set_task(self, task_id, **fields):
         task = self.tasks[task_id]
         task.update(fields)
@@ -144,20 +112,88 @@ class Store:
         pass
 
 
-def test_ioq_outputq():
-    mq = IOQueue(root="./cache")
+def test_ioq_puts(n=25):
+    fn = 'test_cache'
+    if os.path.exists(fn):
+        os.remove(fn)
+    ioq = IOQueues("./test_cache", output_q_name="test_outputq")
 
-    @mq.link(output_q="outq")
-    def qload():
-        idxs = [dict(idx=idx) for idx in range(25)]
-        return idxs
-    
-    mq.run(use_modal=False)
-    items = mq.output_q.gets(50, ack=False, read_all=True)
-    flat = [item['idx'] for item in items]
-    assert all(k in flat for k in range(25))
-    os.remove("./cache")
+    rows = [dict(idx=idx) for idx in range(n)]
+    ioq.puts(rows)
+    assert ioq.output_q.count() == n
+    os.remove('./test_cache')
+
+
+def test_ioq_end_to_end(n=25):
+    import time
+    fn = 'test_cache'
+    if os.path.exists(fn):
+        os.remove(fn)
+
+    rows = [dict(idx=idx) for idx in range(n)]
+    ioq0 = IOQueues("./test_cache", output_q_name="test_inputq")
+    ioq0.puts(rows)
+
+    ioq = IOQueues("./test_cache", 
+                  input_q_name="test_inputq", 
+                  output_q_name="test_outputq",
+                  queue_kwargs=dict(timeout=0.2))
+    assert ioq.size_delta() == n
+
+    _, batch = ioq.gets(n * 2)
+    assert len(batch) == n
+    assert ioq.size_delta() == 0
+
+    # Items recently got are unavailable
+    _, batch2 = ioq.gets(n * 2)
+    assert len(batch2) == 0
+    assert ioq.size_delta() == 0
+
+    # Now we timeout and return unack messages to the queue
+    time.sleep(0.3)
+
+    # Unack messages return to the queue
+    assert ioq.size_delta() == n
+    keys, batch3 = ioq.gets(n * 2)
+    assert len(batch3) == n
+
+    # Ack the messages (now messages default to staying on the queue)
+    ioq.acks(keys)
+    assert ioq.size_delta() == 0
+    os.remove(fn)
+
+
+def test_ioq_e2e_join(n=25):
+    fn = 'test_cache'
+    if os.path.exists(fn):
+        os.remove(fn)
+
+    import time
+    rows = [dict(idx=idx) for idx in range(n)]
+    ioq0 = IOQueues("./test_cache", output_q_name="test_inputq")
+    ioq0.puts(rows)
+
+    # Set timeout to 0, which will effectively turn unack into ready
+    ioq = IOQueues("./test_cache", 
+                  input_q_name="test_inputq", 
+                  output_q_name="test_outputq",
+                  queue_kwargs=dict(timeout=0.0001))
+
+    # Get messages, but with 0 timeout messages become reavailable
+    _, batch = ioq.gets(n * 2)
+    time.sleep(0.1)
+    delta = ioq.size_delta()
+    assert  delta == n
+
+    # Now we process the messages from outputq -- now messages are unavailable
+    transformed = [{**row, **{'processed': True}} for row in batch]
+    ioq.puts(transformed)
+    assert ioq.size_delta() == 0
+
+    os.remove('./test_cache')
 
 
 if __name__ == '__main__':
-    test_ioq()
+    test_ioq_puts()
+    test_ioq_end_to_end()
+    test_ioq_e2e_join()

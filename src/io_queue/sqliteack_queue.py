@@ -16,9 +16,9 @@ import cachetools.func
 class AckStatus(object):
     inited = "0"
     ready = "1"
-    unack = "2"
-    acked = "5"
-    ack_failed = "9"
+    unack = "2"  # Message is popped off by receiever has not ack'd
+    acked = "5"  # Message is popped and receiver has ack'd; assumed done
+    ack_failed = "9" # Reciever has marked message as failed
 
 
 class DummySerializer:
@@ -95,7 +95,6 @@ class SQLiteAckQueue:
     _con = None
     _last_count_update = -1
     last_timeout_application = 0
-    apply_timeout_prob = 0.001
     serializer = json
 
     def __init__(
@@ -127,7 +126,7 @@ class SQLiteAckQueue:
 
     @property
     def con(self):
-        # self.apply_timeout()
+        self.apply_timeout()
         if self._con is None:
             self._con = sqlite3.connect(self.path)
         return self._con
@@ -144,7 +143,7 @@ class SQLiteAckQueue:
         rows = self.select(n, offset, read_all=read_all)
         # Skip the id & timestamp  & status fields by only
         # reading from the 3rd field onward
-        items = [{k: v for (k, v) in zip(self.columns, row[3:])} for row in rows]
+        items = self._process_rows(rows)
         keys = [row[0] for row in rows]
         # Mark them as checked out
         if ack:
@@ -152,6 +151,10 @@ class SQLiteAckQueue:
         self.con.commit()
         if return_keys:
             return keys, items
+        return items
+
+    def _process_rows(self, rows):
+        items = [{k: v for (k, v) in zip(self.columns, row[3:])} for row in rows]
         return items
 
     def select(self, n, offset=0, read_all=False):
@@ -183,8 +186,8 @@ class SQLiteAckQueue:
         cols_str = ", ".join(self.columns)
         vals_str = ", ".join("?" for _ in self.columns)
         insert = self._SQL_INSERT.format(table_name=self._TABLE_NAME,
-                                          table_columns=cols_str,
-                                          table_values=vals_str )
+                                         table_columns=cols_str,
+                                         table_values=vals_str )
         self.con.executemany(insert, items)
         self.con.commit()
     
@@ -256,7 +259,7 @@ class SQLiteAckQueue:
             raise KeyError("Could not update all keys")
         self.con.commit()
 
-    def set(self, row_key_dict, field_dict):
+    def set(self, row_key_dict, **field_dict):
         return self.sets([row_key_dict], [field_dict])
  
     def sets(self, row_key_dicts, field_dicts):
@@ -290,14 +293,13 @@ class SQLiteAckQueue:
             self.delete(keys)
 
     def apply_timeout(self):
+        # Chane unack to ready
         # Don't apply time out if connection isnt open yet
         if self._con is None:
             return
         # Make sure we do not apply the timeout logic too frequently
         dt = time.time() - self.last_timeout_application
         if dt < self.timeout:
-            return
-        if random.random() > self.apply_timeout_prob:
             return
         logger.debug(f"Applying timeout on old unack messages on {self.path}")
         logger.debug(f"Last applied timeout {dt:1.1f} sec ago")
