@@ -19,6 +19,7 @@ class AckStatus(object):
     unack = "2"  # Message is popped off by receiever has not ack'd
     acked = "5"  # Message is popped and receiver has ack'd; assumed done
     ack_failed = "9" # Reciever has marked message as failed
+    ack_done = "17" # Reciever has marked explicitly message as done
 
 
 class DummySerializer:
@@ -172,7 +173,7 @@ class SQLiteAckQueue:
         return rows
 
     def put(self, item):
-        self.puts([item])
+        return self.puts([item])
 
     def puts(self, items):
         assert len(items) > 0, "Must have more than a single item"
@@ -192,9 +193,7 @@ class SQLiteAckQueue:
         self.con.commit()
     
     def update_table_schema(self, row):
-        """ Update table schema 
-        """
-        query = ""
+        """ Update table schema """
         for k, v in row.items():
             if k not in self.columns:
                 self.create_column(k, v)
@@ -287,8 +286,8 @@ class SQLiteAckQueue:
         self.con.execute(qdel)
         self.con.commit()
 
-    def acks(self, keys):
-        self.updates(keys, AckStatus.acked)
+    def acks(self, keys, status=AckStatus.acked):
+        self.updates(keys, status)
         if self.delete_on_ack:
             self.delete(keys)
 

@@ -1,14 +1,10 @@
 """
-- IOQueue.link submits row ids to the job, the job then acks those job ids and marks them as complete
-- ensure that queue size is easily readable without running a table scan so that way the job runner knows when to fire off jobs
-- keep backing sqlite ioq on a shared modal volume when running remotely
-- use file lock on queueioq to prevent concurrent writes
-- Mark tasks  (submitted, started, ended) to keep track of them
--   and (how many inputs each task is claiming)
--   and the timestamp (to keep tasks fresh and cycle out stale ones)
+IOQueues is an object that tracks the progress of items in input and output
+queue and offers a simple way to track jobs finished, failed or complete
+as they get places into the output queue.
+
 """
 import os
-import math
 from uuid import uuid4
 from loguru import logger
 from sqliteack_queue import AckStatus
@@ -42,9 +38,8 @@ class IOQueues:
         self.filename = filename
         self.input_q_name = input_q_name
         self.output_q_name = output_q_name
-        self.input_q = SQLiteAckQueue(filename, table_name=input_q_name, **queue_kwargs)
-        self.output_q = SQLiteAckQueue(filename, table_name=output_q_name, **queue_kwargs)
-        self.tasks = SQLiteAckQueue(filename, table_name="_tasks", **queue_kwargs)
+        self.input_q = SQLiteAckQueue(filename, table_name=input_q_name, **queue_kwargs) if input_q_name else None
+        self.output_q = SQLiteAckQueue(filename, table_name=output_q_name, **queue_kwargs) if output_q_name else None
         self.batch_size = batch_size 
         self.input_q_id_column = input_q_id_column or "_id"
         self.output_q_id_column = output_q_id_column or "_id"
@@ -93,23 +88,6 @@ class IOQueues:
         cursor = self.input_q.con.execute(query)
         (n,) = cursor.fetchone()
         return n
-
-    def init_task(self, status="created"):
-        """ Create a new task entry
-        """
-        task_id = uuid4()
-        self.tasks.put(dict(status=status, task_id=task_id))
-        logger.debug(f"Created task {task_id}")
-        return task_id
-
-    def set_task(self, task_id, **fields):
-        task = self.tasks[task_id]
-        task.update(fields)
-        self.tasks[task_id] = task
-        logger.debug(f"Set {task_id} to {fields}")
-
-    def read_outputq(self):
-        pass
 
 
 def test_ioq_puts(n=25):
