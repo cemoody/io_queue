@@ -77,7 +77,10 @@ class IOQueues:
         cursor = self.input_q.con.execute(query)
         rows = cursor.fetchall()
         keys = [row[0] for row in rows]
-        items = self.input_q._process_rows(rows)
+        columns = list(map(lambda x: x[0], cursor.description))
+        items = [{c: v for (c, v) in zip(columns, row) if c not in ['_id', 'timestamp', 'status']}
+                 for row in rows]
+        items = self.input_q.unflatten_array_columns(items)
         self.input_q.updates(keys, AckStatus.unack)
         if return_keys:
             return keys, items

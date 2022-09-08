@@ -96,6 +96,39 @@ class Linker:
 
 
 def test_ioq_simple(n=25):
+    for batch_size in [1, 7]:
+        fn = 'tasks.db'
+        if os.path.exists(fn):
+            os.remove(fn)
+        fn = 'queues.db'
+        if os.path.exists(fn):
+            os.remove(fn)
+
+        l = Linker(fn)
+
+        @l.link(input_q_name="inq", output_q_name="outq", batch_size=batch_size)
+        def transform(items, **cfg):
+            logger.info(f"Processing {len(items)} items {cfg}")
+            idxs = [{'out': item['idx'] + 50, **item} for item in items]
+            return idxs
+
+        # Load up the DAG with initial data
+        inputs = [dict(idx=idx) for idx in range(n)]
+        l.links['transform'].set_inputs(inputs)
+        
+        # Run until all links report there's no more data
+        # left to process
+        l.run_until_complete()
+
+        # Check outputs are what we expected
+        items = l.links['transform'].get_outputs(100)
+        flat = [item['out'] for item in items]
+        assert all(k in flat for k in range(50, 75))
+        os.remove("tasks.db")
+        os.remove("queues.db")
+
+
+def test_ioq_complex(n=5, batch_size=10):
     fn = 'tasks.db'
     if os.path.exists(fn):
         os.remove(fn)
@@ -105,25 +138,49 @@ def test_ioq_simple(n=25):
 
     l = Linker(fn)
 
-    @l.link(input_q_name="inq", output_q_name="outq")
-    def transform(items):
-        idxs = [{'out': item['idx'] + 50, **item} for item in items]
-        return idxs
+    @l.link(input_q_name="urls", output_q_name="links", batch_size=batch_size)
+    def crawler(items, **cfg):
+        logger.info(f"Processing {len(urls)} items {cfg} ")
+        links = []
+        for item in items:
+            url = item['url']
+            links.append({'link': f"{url}/a.html", **item})
+            links.append({'link': f"{url}/b.html", **item})
+        return links
+
+    @l.link(input_q_name="links", output_q_name="vecs", batch_size=batch_size)
+    def transform(items, **cfg):
+        logger.info(f"Processing {len(items)} links {cfg}")
+        vectors = []
+        for item in items:
+            vectors.append({'vector': [1, 2, 3], **item})
+        return vectors
+
+    @l.link(input_q_name="vecs", output_q_name="mean_vec", batch_size=10000)
+    def sum_vector(items, **cfg):
+        import numpy as np
+        vecs = [item['vector'] for item in items]
+        logger.info(f"Processing {len(vecs)} vecs {cfg}")
+        if len(vecs) == 0:
+            return []
+        sum = float(np.concatenate(vecs).sum())
+        rows = [dict(sum_vector=sum)]
+        return rows
 
     # Load up the DAG with initial data
-    inputs = [dict(idx=idx) for idx in range(n)]
-    l.links['transform'].set_inputs(inputs)
+    urls = [dict(url=f"{idx}.com") for idx in range(n)]
+    l.links['crawler'].set_inputs(urls)
     
     # Run until all links report there's no more data
     # left to process
     l.run_until_complete()
 
     # Check outputs are what we expected
-    items = l.links['transform'].get_outputs(100)
-    flat = [item['out'] for item in items]
-    assert all(k in flat for k in range(50, 75))
+    row, = l.links['sum_vector'].get_outputs(100)
+    assert row['sum_vector'] == 60.0
     os.remove("tasks.db")
     os.remove("queues.db")
 
 if __name__ == '__main__':
     test_ioq_simple()
+    test_ioq_complex()
